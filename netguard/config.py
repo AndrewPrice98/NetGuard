@@ -49,6 +49,7 @@ class WebConfig:
 class AlertConfig:
     suppress_minutes: float = 60.0
     log: str = ""             # JSON-lines file path; blank = off
+    log_format: str = "json"  # json | ecs (Elastic Common Schema) | cef
 
 
 @dataclass
@@ -83,12 +84,14 @@ class Config:
 
         notify = data.get("notify", [])
         for n in notify:
-            if n.get("type") not in ("desktop", "webhook", "email"):
-                raise ValueError(f"[[notify]] type must be desktop, webhook or email: {n}")
+            if n.get("type") not in ("desktop", "webhook", "email", "syslog"):
+                raise ValueError(f"[[notify]] type must be desktop, webhook, email or syslog: {n}")
             sev = n.get("min_severity", "HIGH").upper()
             if sev not in Severity.__members__:
                 raise ValueError(f"Bad min_severity {sev!r}")
 
+        alerts = section(AlertConfig, "alerts")
+        if alerts.log_format not in ("json", "ecs", "cef"):
+            raise ValueError(f"[alerts] log_format must be json, ecs or cef: {alerts.log_format!r}")
         return cls(scan=section(ScanConfig, "scan"), sniff=section(SniffConfig, "sniff"),
-                   web=section(WebConfig, "web"), alerts=section(AlertConfig, "alerts"),
-                   notify=notify)
+                   web=section(WebConfig, "web"), alerts=alerts, notify=notify)

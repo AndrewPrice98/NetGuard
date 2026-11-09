@@ -212,7 +212,8 @@ class Monitor:
         interval = interval or self.config.scan.interval
         self.status.interval = interval
         with Store(self.db_path) as store:
-            notifier = Notifier(store, build_sinks(self.config.notify, self.config.alerts.log),
+            notifier = Notifier(store, build_sinks(self.config.notify, self.config.alerts.log,
+                                                self.config.alerts.log_format),
                                 self.config.alerts.suppress_minutes, quiet=self.quiet)
             if self.config.sniff.enabled:
                 try:

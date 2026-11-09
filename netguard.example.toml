@@ -26,6 +26,7 @@ token = ""             # required for API access when set; needed for non-localh
 [alerts]
 suppress_minutes = 60  # don't repeat an identical alert within this window
 log = ""               # e.g. "alerts.jsonl" for a SIEM / jq
+log_format = "json"    # json | ecs (Elastic Common Schema) | cef (Splunk, QRadar, ArcSight)
 
 # --- Notifications (add as many as you like) -------------------------------
 
@@ -55,3 +56,10 @@ min_severity = "HIGH"
 # from = "you@gmail.com"
 # to = ["you@gmail.com"]
 # min_severity = "HIGH"
+
+# [[notify]]
+# type = "syslog"          # RFC 5424 over UDP to a SIEM collector
+# host = "10.0.0.5"
+# port = 514
+# format = "cef"           # cef | ecs | json
+# min_severity = "LOW"

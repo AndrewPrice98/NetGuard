@@ -87,6 +87,43 @@ def build_report(store: Store, days: int = 7) -> str:
         "</div>",
     ]
 
+    # Incidents: what an executive reader needs first.
+    from .incidents import load_incidents
+    from .metrics import soc_metrics
+    incidents = [i for i in load_incidents(store, days) if i.last_ts >= since]
+    out.append(f"<h2>Incidents ({len(incidents)})</h2>")
+    if incidents:
+        out.append("<table><tr><th>ID</th><th>Severity</th><th>Incident</th><th>Device</th>"
+                   "<th>ATT&amp;CK progression</th><th>Alerts</th><th>Status</th></tr>")
+        for i in incidents:
+            out.append(
+                f"<tr><td class='mono' style='white-space:nowrap'>{escape(i.id)}</td>"
+                f"<td>{_sev(i.severity.name)}</td>"
+                f"<td><b>{escape(i.pattern.title)}</b></td>"
+                f"<td>{escape(i.name or '')} <span class='mono'>{escape(i.ip or i.mac)}</span></td>"
+                f"<td>{escape(' → '.join(i.tactics) or '—')}</td><td>{len(i.alerts)}</td>"
+                f"<td>{escape(i.status.replace('_', ' '))}</td></tr>")
+        out.append("</table>")
+    else:
+        out.append("<p class='empty'>No incidents in this period.</p>")
+
+    m = soc_metrics(store, days)
+
+    def _d(s):
+        if s is None:
+            return "—"
+        mins = round(s / 60)
+        return f"{mins // 60}h {mins % 60:02d}m" if mins >= 60 else f"{mins}m"
+
+    fp = m["false_positive_rate"]
+    out.append("<h2>Response</h2><div class='tiles'>")
+    for n, label in ((_d(m["mtta"]["median"]), "median time to triage"),
+                     (_d(m["mttr"]["median"]), "median time to resolve"),
+                     ("—" if fp is None else f"{round(fp * 100)}%", "false-positive rate"),
+                     (m["open"], "alerts still open")):
+        out.append(f"<div class='tile'><b>{escape(str(n))}</b><span>{escape(label)}</span></div>")
+    out.append("</div>")
+
     # Alerts by severity
     out.append("<h2>Alerts by severity</h2><table><tr>")
     out += [f"<th>{_sev(s.name)}</th>" for s in reversed(Severity)]

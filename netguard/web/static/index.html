@@ -16,15 +16,18 @@
       </a>
       <nav class="nav" aria-label="Main">
         <a href="#/overview" data-page="overview">Overview</a>
+        <a href="#/incidents" data-page="incidents">Incidents <span class="nav-n" id="nav-incidents"></span></a>
         <a href="#/alerts" data-page="alerts">Alerts <span class="nav-n" id="nav-alerts"></span></a>
         <a href="#/devices" data-page="devices">Devices <span class="nav-n" id="nav-devices"></span></a>
         <a href="#/activity" data-page="activity">Activity</a>
+        <a href="#/detections" data-page="detections">Detections</a>
         <a href="#/rules" data-page="rules">Rules</a>
       </nav>
       <div class="monitor" id="monitor">
         <span class="mon-state" id="status-pill">Connecting</span>
         <span class="mon-facts" id="monitor-facts"></span>
         <button class="btn" id="scan-btn" type="button">Scan now</button>
+        <button class="btn danger" id="stop-btn" type="button" title="Shut down this NetGuard server">Stop</button>
       </div>
     </div>
   </header>

@@ -7,7 +7,8 @@ configured under [[notify]] in netguard.toml, push it further:
     desktop  native OS notification (Windows balloon, macOS, notify-send)
     webhook  Discord, Slack, ntfy.sh or plain JSON POST
     email    SMTP (password read from an environment variable)
-    jsonl    JSON-lines log for a SIEM / jq (via [alerts] log = "...")
+    syslog   RFC 5424 over UDP to a SIEM collector, CEF or ECS payload
+    jsonl    log file for a SIEM / jq (via [alerts] log = "..."), JSON/ECS/CEF
 
 Remote sinks run on a small thread pool so a slow webhook can't stall a scan.
 """
@@ -20,6 +21,7 @@ import logging
 import os
 import platform
 import smtplib
+import socket
 import subprocess
 import sys
 import threading
@@ -29,6 +31,7 @@ from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from pathlib import Path
 
+from . import siem
 from .models import Alert, Severity
 from .store import Store
 
@@ -87,14 +90,43 @@ class Sink:
 
 
 class JsonlSink(Sink):
-    def __init__(self, path: Path) -> None:
+    """One alert per line: NetGuard JSON, ECS JSON, or CEF (see siem.py)."""
+
+    def __init__(self, path: Path, fmt: str = "json") -> None:
         super().__init__("INFO")
-        self.path = path
+        if fmt not in siem.FORMATS:
+            raise ValueError(f"Unknown log format {fmt!r}")
+        self.path, self.fmt = path, fmt
         self._lock = threading.Lock()
 
     def send(self, alert: Alert) -> None:
         with self._lock, self.path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(alert.to_dict()) + "\n")
+            f.write(siem.format_alert(alert, self.fmt) + "\n")
+
+
+class SyslogSink(Sink):
+    """RFC 5424 syslog over UDP to a SIEM collector, CEF or ECS payload."""
+
+    remote = True
+    PRI = {Severity.CRITICAL: 2, Severity.HIGH: 3, Severity.MEDIUM: 4,
+           Severity.LOW: 5, Severity.INFO: 6}  # syslog severities, facility local4
+
+    def __init__(self, host: str, port: int = 514, format: str = "cef",
+                 min_severity: str = "LOW") -> None:
+        super().__init__(min_severity)
+        if format not in siem.FORMATS:
+            raise ValueError(f"Unknown syslog format {format!r}")
+        self.host, self.port, self.format = host, int(port), format
+
+    def build(self, alert: Alert) -> bytes:
+        pri = 20 * 8 + self.PRI[alert.severity]
+        host = _one_line(platform.node() or "-").replace(" ", "")[:255] or "-"
+        body = _one_line(siem.format_alert(alert, self.format))
+        return f"<{pri}>1 {alert.ts or '-'} {host} netguard - {alert.kind} - {body}".encode()
+
+    def send(self, alert: Alert) -> None:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.sendto(self.build(alert)[:8192], (self.host, self.port))
 
 
 class DesktopSink(Sink):
@@ -197,10 +229,11 @@ class EmailSink(Sink):
             smtp.send_message(self.build(alert))
 
 
-def build_sinks(notify: list[dict], jsonl: str | Path | None = None) -> list[Sink]:
+def build_sinks(notify: list[dict], jsonl: str | Path | None = None,
+                jsonl_format: str = "json") -> list[Sink]:
     sinks: list[Sink] = []
     if jsonl:
-        sinks.append(JsonlSink(Path(jsonl)))
+        sinks.append(JsonlSink(Path(jsonl), jsonl_format))
     for raw in notify:
         opts = {k: v for k, v in raw.items() if k != "type"}
         kind = raw["type"]
@@ -210,6 +243,8 @@ def build_sinks(notify: list[dict], jsonl: str | Path | None = None) -> list[Sin
             sinks.append(WebhookSink(**opts))
         elif kind == "email":
             sinks.append(EmailSink(**opts))
+        elif kind == "syslog":
+            sinks.append(SyslogSink(**opts))
     return sinks
 
 

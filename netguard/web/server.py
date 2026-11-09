@@ -24,17 +24,22 @@ import hmac
 import io
 import json
 import logging
+import os
 import re
+import socket
 import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
-from .. import __version__, discovery, oui
+from .. import __version__, discovery, oui, siem
+from ..correlate import compression, find
 from ..fingerprint import TYPE_LABELS
+from ..incidents import incident_markdown, load_incidents, set_incident_status
+from ..metrics import coverage, rule_fidelity, soc_metrics
 from ..models import ALERT_STATUSES, OPEN_STATUSES, Host, PortState, Severity
-from ..playbooks import PLAYBOOKS, playbook
+from ..playbooks import PLAYBOOKS, TACTICS, playbook
 from ..portscan import RISKY_PORTS
 from ..report import build_report
 from ..store import Store, iso_ago
@@ -83,6 +88,15 @@ def risk_level(score: int) -> str:
 # --- Server -----------------------------------------------------------------
 class DashboardServer(ThreadingHTTPServer):
     daemon_threads = True
+    # On Windows SO_REUSEADDR lets a second process bind a port that is already
+    # listening, so two copies would silently share it. Use exclusive binding
+    # there instead; elsewhere SO_REUSEADDR only allows fast restarts.
+    allow_reuse_address = os.name != "nt"
+
+    def server_bind(self) -> None:
+        if os.name == "nt":
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
 
     def __init__(self, address: tuple[str, int], db_path: Path | str,
                  monitor=None, token: str = "") -> None:
@@ -90,6 +104,7 @@ class DashboardServer(ThreadingHTTPServer):
         self.db_path = db_path
         self.monitor = monitor
         self.token = token
+        self.stopped_by_user = False
 
 
 class ApiError(Exception):
@@ -127,6 +142,13 @@ class Handler(BaseHTTPRequestHandler):
         ("POST", r"/api/alerts/(?P<id>\d+)/ack", "post_ack"),
         ("POST", r"/api/alerts/bulk", "post_bulk"),
         ("POST", r"/api/alerts/ack-all", "post_ack_all"),
+        ("GET", r"/api/incidents", "get_incidents"),
+        ("GET", r"/api/incidents/(?P<id>INC-\d{1,9})", "get_incident"),
+        ("POST", r"/api/incidents/(?P<id>INC-\d{1,9})/status", "post_incident_status"),
+        ("GET", r"/api/incidents/(?P<id>INC-\d{1,9})/report\.md", "get_incident_report"),
+        ("GET", r"/api/metrics", "get_metrics"),
+        ("GET", r"/api/detections", "get_detections"),
+        ("GET", r"/api/validation", "get_validation"),
         ("GET", r"/api/events", "get_events"),
         ("GET", r"/api/suppressions", "get_suppressions"),
         ("POST", r"/api/suppressions", "post_suppression"),
@@ -134,8 +156,10 @@ class Handler(BaseHTTPRequestHandler):
         ("GET", r"/api/playbooks", "get_playbooks"),
         ("GET", r"/api/export/alerts\.csv", "export_alerts_csv"),
         ("GET", r"/api/export/alerts\.json", "export_alerts_json"),
+        ("GET", r"/api/export/alerts\.ecs\.ndjson", "export_alerts_ecs"),
         ("GET", r"/api/export/hosts\.csv", "export_hosts_csv"),
         ("POST", r"/api/scan", "post_scan"),
+        ("POST", r"/api/shutdown", "post_shutdown"),
     ]]
 
     # -- plumbing ------------------------------------------------------------
@@ -359,6 +383,8 @@ class Handler(BaseHTTPRequestHandler):
         # marker, so fall back to the earliest sighting.
         baseline_at = store.get_meta("baseline_at") or min(
             (h.first_seen for h in hosts if h.first_seen), default="")
+        incidents = load_incidents(store)
+        open_inc = [i for i in incidents if i.is_open]
         return {
             "version": __version__,
             "monitoring": mon is not None,
@@ -366,6 +392,8 @@ class Handler(BaseHTTPRequestHandler):
             "status": status,
             "alerts": store.alert_counts(unacked_only=True),
             "statuses": store.status_counts(),
+            "incidents": {"open": len(open_inc), "total": len(incidents),
+                          "critical": sum(i.severity >= Severity.CRITICAL for i in open_inc)},
             "hosts": len(hosts),
             "online": sum(h.online for h in hosts),
             "untrusted": sum(not h.trusted for h in hosts),
@@ -379,12 +407,15 @@ class Handler(BaseHTTPRequestHandler):
                        for d in store.top_devices(days)]
         urgent = store.recent_alerts(limit=6, min_severity=Severity.HIGH,
                                      statuses=list(OPEN_STATUSES))
+        incidents = load_incidents(store, max(days, 30))
         return {
             "series": store.alert_series(days),
             "top_kinds": [{**k, "title": playbook(k["kind"])["title"]}
                           for k in store.top_kinds(days)],
             "top_devices": top_devices,
             "urgent": [a.to_dict() for a in urgent],
+            "incidents": [i.to_dict() for i in incidents if i.is_open][:6],
+            "metrics": soc_metrics(store, 30),
             "events": [e.to_dict() for e in store.events(limit=10)],
         }
 
@@ -440,10 +471,16 @@ class Handler(BaseHTTPRequestHandler):
             related = [r.to_dict() for r in store.recent_alerts(limit=20, mac=host.mac,
                                                                 statuses=None)
                        if r.id != a.id]
+        incident = next((i for i in load_incidents(store, 90)
+                         if any(x.id == a.id for x in i.alerts)), None)
         return {**a.to_dict(), "playbook": playbook(a.kind),
                 "host": {"mac": host.mac, "ip": host.ip, "name": host.alias or host.hostname,
                          "trusted": host.trusted, "vendor": host.vendor} if host else None,
-                "related": related}
+                "related": related,
+                "history": store.alert_history(a.id),
+                "incident": {"id": incident.id, "title": incident.pattern.title,
+                             "severity": incident.severity.name, "status": incident.status,
+                             "alert_count": len(incident.alerts)} if incident else None}
 
     def post_alert_status(self, store: Store, id: str) -> dict:
         status = self.body.get("status")
@@ -476,6 +513,73 @@ class Handler(BaseHTTPRequestHandler):
 
     def post_ack_all(self, store: Store) -> dict:
         return {"ok": True, "acked": store.ack_all()}
+
+    # -- endpoints: incidents ------------------------------------------------
+    def _incident_or_404(self, store: Store, incident_id: str):
+        inc = find(load_incidents(store, self._q_int("days", 90, 1, 365)), incident_id)
+        if inc is None:
+            raise ApiError(HTTPStatus.NOT_FOUND, "No such incident")
+        return inc
+
+    def get_incidents(self, store: Store) -> list[dict]:
+        status = (self._q("status") or "open").lower()
+        if status not in ("open", "closed", "all"):
+            raise ApiError(HTTPStatus.BAD_REQUEST, "status must be open, closed or all")
+        incidents = load_incidents(store, self._q_int("days", 30, 1, 365))
+        if status != "all":
+            incidents = [i for i in incidents if i.is_open == (status == "open")]
+        return [i.to_dict() for i in incidents]
+
+    def get_incident(self, store: Store, id: str) -> dict:
+        inc = self._incident_or_404(store, id)
+        data = inc.to_dict(full=True)
+        data["alerts"] = [a.to_dict() for a in inc.alerts]
+        data["events"] = [e.to_dict() for e in store.events(limit=300, mac=inc.mac)
+                          if inc.first_ts <= e.ts <= inc.last_ts] if inc.mac else []
+        return data
+
+    def post_incident_status(self, store: Store, id: str) -> dict:
+        status = self.body.get("status")
+        if status not in ("new", "investigating", "resolved", "false_positive"):
+            raise ApiError(HTTPStatus.BAD_REQUEST, "status must be new, investigating, "
+                                                   "resolved or false_positive")
+        inc = self._incident_or_404(store, id)
+        updated = set_incident_status(store, inc, status, str(self.body.get("note") or "")[:1000])
+        return {"ok": True, "updated": updated}
+
+    def get_incident_report(self, store: Store, id: str) -> RawResponse:
+        inc = self._incident_or_404(store, id)
+        return RawResponse(incident_markdown(store, inc).encode(), "text/markdown; charset=utf-8",
+                           f"{inc.id}.md")
+
+    # -- endpoints: SOC metrics & detection engineering ------------------------
+    def get_metrics(self, store: Store) -> dict:
+        days = self._q_int("days", 30, 1, 365)
+        alerts = store.recent_alerts(limit=20000, since=iso_ago(days=days), statuses=None)
+        return {**soc_metrics(store, days),
+                "correlation": compression(alerts, load_incidents(store, days))}
+
+    def get_detections(self, store: Store) -> dict:
+        from ..simulate import SCENARIOS
+        return {
+            "tactics": TACTICS,
+            "coverage": coverage(),
+            "rules": rule_fidelity(store, self._q_int("days", 30, 1, 365)),
+            "scenarios": [{"name": s.name, "title": s.title, "technique": s.technique,
+                           "description": s.description, "expect": sorted(s.expect),
+                           "forbid": sorted(s.forbid), "gap": s.gap} for s in SCENARIOS],
+        }
+
+    def get_validation(self, store: Store) -> list[dict]:
+        """Replay every attack simulation through the detectors right now."""
+        from ..simulate import validate_all
+        return [{"name": r.scenario.name, "passed": r.passed, "fired": sorted(r.fired),
+                 "missing": sorted(r.missing), "unexpected": sorted(r.unexpected),
+                 "packets": r.analysis.packets,
+                 "alerts": [{"kind": a.kind, "severity": a.severity.name,
+                             "frame": a.details.get("frame"), "message": a.message}
+                            for a in r.analysis.alerts]}
+                for r in validate_all()]
 
     # -- endpoints: activity, rules, reference -------------------------------
     def get_events(self, store: Store) -> list[dict]:
@@ -534,6 +638,12 @@ class Handler(BaseHTTPRequestHandler):
         return RawResponse(json.dumps(data, indent=2).encode(), "application/json",
                            "netguard-alerts.json")
 
+    def export_alerts_ecs(self, store: Store) -> RawResponse:
+        lines = [siem.format_alert(a, "ecs") for a in
+                 reversed(self._filtered_alerts(store, default_limit=5000))]
+        return RawResponse(("\n".join(lines) + "\n").encode(), "application/x-ndjson",
+                           "netguard-alerts.ecs.ndjson")
+
     def export_hosts_csv(self, store: Store) -> RawResponse:
         out = io.StringIO()
         w = csv.writer(out)
@@ -554,6 +664,15 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(HTTPStatus.SERVICE_UNAVAILABLE, "Dashboard is in view-only mode")
         if not mon.trigger_scan():
             raise ApiError(HTTPStatus.CONFLICT, "A scan is already running")
+        return {"ok": True}
+
+    def post_shutdown(self, store: Store) -> dict:
+        """The dashboard's Stop button. Same CSRF/token checks as every write,
+        so a web page can't stop it. shutdown() waits for serve_forever() to
+        return, so it must run on another thread; the response goes out first."""
+        logger.warning("Shutdown requested from the dashboard")
+        self.server.stopped_by_user = True
+        threading.Timer(0.3, self.server.shutdown).start()
         return {"ok": True}
 
 
@@ -597,22 +716,86 @@ def _relaunch() -> None:
     os._exit(0)
 
 
+# --- Finding, reusing and stopping a running copy ---------------------------
+PORT_ATTEMPTS = 20
+
+
+def running_netguard(port: int, token: str = "", timeout: float = 1.5) -> dict | None:
+    """Status of the NetGuard listening on localhost:`port`, or None if the
+    port is free or held by something else. {} if it's NetGuard but needs a token."""
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/api/status",
+                                 headers={"Host": "localhost", "X-NetGuard-Token": token})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if not (resp.headers.get("Server") or "").startswith("NetGuard"):
+                return None
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        return {} if (exc.headers.get("Server") or "").startswith("NetGuard") else None
+    except (OSError, ValueError):
+        return None
+
+
+def stop_running(port: int, token: str = "") -> bool:
+    """Ask the NetGuard on localhost:`port` to shut down. True if it agreed."""
+    import urllib.request
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/shutdown", data=b"", method="POST",
+        headers={"Host": "localhost", "X-NetGuard": "1", "X-NetGuard-Token": token})
+    try:
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            return resp.status == 200
+    except OSError:
+        return False
+
+
+def _bind(host: str, port: int, db_path, monitor, token: str, reuse_existing: bool,
+          open_browser: bool) -> "DashboardServer | None":
+    try:
+        return DashboardServer((host, port), db_path, monitor, token)
+    except OSError:
+        pass
+    existing = running_netguard(port, token)
+    if reuse_existing and existing and existing.get("monitoring"):
+        url = f"http://localhost:{port}/"
+        print(f"NetGuard is already running and monitoring: {url}\n"
+              f"(Use the Stop button in the dashboard, or `netguard stop --port {port}`, "
+              "to shut it down.)", flush=True)
+        if open_browser:
+            import webbrowser
+            webbrowser.open(url)
+        return None
+    for candidate in range(port + 1, port + PORT_ATTEMPTS):
+        try:
+            httpd = DashboardServer((host, candidate), db_path, monitor, token)
+        except OSError:
+            continue
+        who = "another NetGuard" if existing is not None else "another program"
+        print(f"Port {port} is in use by {who}; using port {candidate} instead.", flush=True)
+        return httpd
+    raise SystemExit(f"Ports {port}-{port + PORT_ATTEMPTS - 1} are all in use. "
+                     "Pass --port to choose another.")
+
+
 # --- Entry point ------------------------------------------------------------
 def serve(db_path: Path | str, host: str = "127.0.0.1", port: int = 8000,
           monitor=None, token: str = "", open_browser: bool = False,
-          reload: bool = False) -> None:
-    """Run the dashboard (and the monitor loop, if given) until Ctrl+C."""
+          reload: bool = False, reuse_existing: bool = False) -> None:
+    """Run the dashboard (and the monitor loop, if given) until Ctrl+C or
+    the dashboard's Stop button.
+
+    If the port is busy: with `reuse_existing`, a NetGuard that is already
+    monitoring there is simply opened; otherwise the next free port is used.
+    """
     if host not in LOOPBACK_NAMES and not token:
         raise SystemExit("Refusing to listen on a non-loopback address without a token. "
                          "Set [web] token in netguard.toml or pass --token.")
 
-    try:
-        httpd = DashboardServer((host, port), db_path, monitor, token)
-    except OSError as exc:
-        raise SystemExit(
-            f"Port {port} is already in use ({exc.strerror}). Is NetGuard already running, "
-            "for example as the Windows startup task? Open http://localhost:"
-            f"{port}/ or pass --port to run a second copy.")
+    httpd = _bind(host, port, db_path, monitor, token, reuse_existing, open_browser)
+    if httpd is None:
+        return  # an existing NetGuard was opened instead
     reload_flag = threading.Event()
     if reload:
         threading.Thread(target=_watch_for_updates, args=(httpd, reload_flag),
@@ -635,5 +818,7 @@ def serve(db_path: Path | str, host: str = "127.0.0.1", port: int = 8000,
         if monitor:
             monitor.stop()
         httpd.server_close()  # free the port before the new copy binds it
-    if reload_flag.is_set():
+    if httpd.stopped_by_user:
+        print("Stopped from the dashboard.")
+    elif reload_flag.is_set():
         _relaunch()

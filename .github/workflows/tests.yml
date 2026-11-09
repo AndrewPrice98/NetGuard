@@ -19,3 +19,27 @@ jobs:
           python-version: ${{ matrix.python }}
       - run: pip install -e ".[dev]"
       - run: python -m pytest -v
+
+  detections:
+    # Detection-as-code: replay every attack simulation through the real
+    # detectors. A rule that stops firing (or starts firing on benign
+    # traffic) fails the build.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -e .
+      - name: Validate detections against attack simulations
+        run: netguard validate --verbose
+      - name: Committed sample captures still produce the expected alerts
+        run: |
+          netguard pcap samples/mitm_kill_chain.pcap --json > kill_chain.json
+          python -c "import json; k={a['kind'] for a in json.load(open('kill_chain.json'))['alerts']}; assert {'port_scan','gateway_arp_spoof'} <= k, k"
+      - name: Build the attack captures as artifacts
+        run: netguard simulate -o captures
+      - uses: actions/upload-artifact@v4
+        with:
+          name: attack-simulation-pcaps
+          path: captures/

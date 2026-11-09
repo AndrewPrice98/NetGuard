@@ -195,4 +195,50 @@ DEFAULT = {"title": "", "tactic": "", "mitre": [], "summary": "", "triage": [], 
 
 
 def playbook(kind: str) -> dict:
-    return {**DEFAULT, "title": kind.replace("_", " ").capitalize(), **PLAYBOOKS.get(kind, {})}
+    return {**DEFAULT, "title": kind.replace("_", " ").capitalize(), **PLAYBOOKS.get(kind, {}),
+            **DETECTIONS.get(kind, {})}
+
+
+# --- Detection engineering metadata ------------------------------------------
+# ATT&CK enterprise tactics in matrix order. Used to order and count the
+# stages of an incident, and to lay out the coverage matrix.
+TACTICS = [
+    "Reconnaissance", "Resource Development", "Initial Access", "Execution",
+    "Persistence", "Privilege Escalation", "Defense Evasion", "Credential Access",
+    "Discovery", "Lateral Movement", "Collection", "Command and Control",
+    "Exfiltration", "Impact",
+]
+
+# Per rule: the one tactic it represents in an attack chain ("stage"), where
+# its data comes from, its default severity, and the simulated scenario
+# (see simulate.py) that proves it fires. `netguard validate` runs them all.
+DETECTIONS: dict[str, dict] = {
+    "gateway_mac_changed": {"stage": "Credential Access", "source": "scan",
+                            "default_severity": "CRITICAL",
+                            "validated_by": "test_detect.py::test_arp_spoof_of_gateway"},
+    "gateway_arp_spoof": {"stage": "Credential Access", "source": "sniffer / pcap",
+                          "default_severity": "CRITICAL", "validated_by": "arp_spoof_gateway"},
+    "arp_spoof": {"stage": "Credential Access", "source": "scan",
+                  "default_severity": "HIGH", "validated_by": "test_detect.py::test_arp_spoof_of_gateway"},
+    "arp_mismatch": {"stage": "Credential Access", "source": "sniffer / pcap",
+                     "default_severity": "MEDIUM", "validated_by": "arp_poison_host"},
+    "duplicate_mac": {"stage": "Defense Evasion", "source": "scan",
+                      "default_severity": "MEDIUM",
+                      "validated_by": "test_detect.py::test_duplicate_mac_without_gateway_is_medium"},
+    "rogue_dhcp": {"stage": "Credential Access", "source": "sniffer / pcap",
+                   "default_severity": "CRITICAL", "validated_by": "rogue_dhcp"},
+    "port_scan": {"stage": "Discovery", "source": "sniffer / pcap",
+                  "default_severity": "HIGH", "validated_by": "port_scan"},
+    "new_port": {"stage": "Persistence", "source": "scan",
+                 "default_severity": "HIGH / MEDIUM", "validated_by": "test_detect.py::test_new_risky_port_is_high"},
+    "new_host": {"stage": "Initial Access", "source": "scan",
+                 "default_severity": "MEDIUM", "validated_by": "test_detect.py::test_new_host_reported_once"},
+    "ip_changed_hands": {"stage": "", "source": "scan",
+                         "default_severity": "LOW", "validated_by": "test_detect.py::test_ip_changed_hands"},
+    "dhcp_server_learned": {"stage": "", "source": "sniffer / pcap",
+                            "default_severity": "INFO", "validated_by": "benign_baseline"},
+}
+
+
+def tactic_index(tactic: str) -> int:
+    return TACTICS.index(tactic) if tactic in TACTICS else len(TACTICS)

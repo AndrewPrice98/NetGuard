@@ -17,6 +17,7 @@ const EVENT_LABELS = {
   ip_change: "IP change", port_open: "Port opened", port_closed: "Port closed",
 };
 const SNIFFER_NAMES = { arp: "ARP", dhcp: "DHCP", port_scan: "port scan" };
+const INCIDENT_STATUS = { new: "New", investigating: "Investigating", resolved: "Resolved", false_positive: "False positive" };
 const SVG_NS = "http://www.w3.org/2000/svg";
 
 // 24x24 stroke icons (one consistent line set; no emoji).
@@ -110,6 +111,17 @@ function ago(iso) {
 }
 
 const fullTime = (iso) => (iso ? new Date(iso).toLocaleString() : "");
+
+// Seconds -> "45s", "14m", "2h 05m", "3d 4h". Null -> "—".
+function dur(sec) {
+  if (sec === null || sec === undefined) return "—";
+  if (sec < 60) return `${Math.round(sec)}s`;
+  const m = Math.round(sec / 60);
+  if (m < 60) return `${m}m`;
+  if (m < 48 * 60) return `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, "0")}m`;
+  return `${Math.floor(m / 1440)}d ${Math.round((m % 1440) / 60)}h`;
+}
+const pct = (x) => (x === null || x === undefined ? "—" : `${Math.round(x * 100)}%`);
 function stamp(iso) {  // compact, sortable-looking local timestamp: "Nov 09 15:03"
   if (!iso) return "";
   const d = new Date(iso);
@@ -236,6 +248,7 @@ function renderStatus() {
   const facts = [];
   if (data.monitoring) {
     if (st.subnet) facts.push(st.subnet);
+    if (st.sniffer?.length) facts.push(`live: ${st.sniffer.map((n) => SNIFFER_NAMES[n]).join(", ")}`);
     if (st.last_scan) facts.push(`scanned ${ago(st.last_scan)}`);
     if (st.next_scan && !st.scanning) {
       const s = Math.max(0, Math.round(st.next_scan - Date.now() / 1000));
@@ -252,6 +265,9 @@ function renderStatus() {
   const navA = $("nav-alerts");
   navA.textContent = open || "";
   navA.classList.toggle("hot", data.alerts.CRITICAL + data.alerts.HIGH > 0);
+  const navI = $("nav-incidents");
+  navI.textContent = data.incidents?.open || "";
+  navI.classList.toggle("hot", (data.incidents?.critical || 0) > 0);
   $("nav-devices").textContent = data.untrusted || "";
 
   const banner = $("banner");
@@ -492,7 +508,7 @@ const OverviewPage = {
           el("span", {}, el("i", { class: "lg-node off" }), "offline"),
           el("span", {}, el("i", { class: "lg-alert" }), "open alert")), el("div", { id: "ov-map", class: "map-box" })),
         el("div", { class: "stack" },
-          panel("Needs attention", "Open high and critical", el("div", { id: "ov-urgent" })),
+          panel("Active incidents", el("a", { href: "#/incidents", class: "link" }, "All incidents"), el("div", { id: "ov-urgent" })),
           panel("Highest risk devices", null, el("div", { id: "ov-risky" })))),
       panel("Recent activity", el("a", { href: "#/activity", class: "link" }, "All activity"), el("div", { id: "ov-events" })),
     );
@@ -512,13 +528,18 @@ const OverviewPage = {
     }));
     $("ov-map").replaceChildren(networkMap(hosts, (mac) => go("devices", mac)));
 
-    $("ov-urgent").replaceChildren(ov.urgent.length
-      ? el("ul", { class: "rows" }, ov.urgent.map((a) => el("li", {},
-          el("a", { href: `#/alerts/${a.id}`, class: "row-link" },
-            sevTag(a.severity),
-            el("span", { class: "row-main" }, el("b", {}, pbTitle(a.kind)), el("small", {}, a.message)),
-            el("time", { class: "muted", title: fullTime(a.ts) }, ago(a.ts))))))
-      : empty("No open high or critical alerts."));
+    this.metrics = ov.metrics;
+    this.renderStats();
+    $("ov-urgent").replaceChildren(ov.incidents.length
+      ? el("ul", { class: "rows" }, ov.incidents.map((i) => el("li", {},
+          el("a", { href: `#/incidents/${i.id}`, class: "row-link" },
+            sevTag(i.severity),
+            el("span", { class: "row-main" },
+              el("b", {}, i.title),
+              el("small", {}, `${i.id} · ${i.name || i.ip || i.mac} · ${i.alert_count} alert${i.alert_count === 1 ? "" : "s"}`
+                + (i.tactics.length ? ` · ${i.tactics.join(" → ")}` : ""))),
+            el("time", { class: "muted", title: fullTime(i.last_ts) }, ago(i.last_ts))))))
+      : empty("No open incidents. Correlated alerts appear here as cases."));
 
     const risky = [...hosts].filter((h) => h.risk > 0).sort((a, b) => b.risk - a.risk).slice(0, 5);
     $("ov-risky").replaceChildren(risky.length
@@ -534,19 +555,139 @@ const OverviewPage = {
   },
   renderStats() {
     const s = state.status;
-    if (!s) return;
+    if (!s || !$("ov-stats")) return;
     const a = s.alerts, urgent = a.CRITICAL + a.HIGH;
     const open = s.statuses.new + s.statuses.investigating;
-    const sn = s.status?.sniffer || [];
+    const inc = s.incidents || { open: 0, critical: 0 };
+    const m = this.metrics;
     $("ov-stats").replaceChildren(
+      stat("Open incidents", inc.open, inc.critical ? `${inc.critical} critical` : "correlated cases", { alarm: inc.critical > 0, href: "#/incidents" }),
       stat("Open alerts", open, urgent ? `${a.CRITICAL} critical, ${a.HIGH} high` : "none high or critical", { alarm: urgent > 0, href: "#/alerts" }),
-      stat("Investigating", s.statuses.investigating, "assigned to triage", { href: "#/alerts" }),
+      stat("Time to triage", m ? dur(m.mtta.median) : "—", m?.mtta.n ? `median of ${m.mtta.n}, 30 days` : "no triage yet", { href: "#/detections" }),
+      stat("Time to resolve", m ? dur(m.mttr.median) : "—", m?.mttr.n ? `median of ${m.mttr.n}, 30 days` : "nothing closed yet", { href: "#/detections" }),
       stat("Devices online", `${s.online} / ${s.hosts}`, s.hosts - s.online ? `${s.hosts - s.online} offline` : "all present", { href: "#/devices" }),
       stat("Untrusted", s.untrusted, s.untrusted ? "awaiting review" : "all in baseline", { alarm: s.untrusted > 0, href: "#/devices" }),
-      stat("Live capture", sn.length ? "On" : "Off", sn.length ? sn.map((n) => SNIFFER_NAMES[n]).join(", ") : "scan-based detection"),
     );
   },
 };
+
+// ============================================================================
+// Page: Incidents (correlated cases)
+// ============================================================================
+const incStatusTag = (st) => el("span", { class: `st st-${st}` }, el("i"), INCIDENT_STATUS[st] || st);
+
+function tacticChain(tactics, compact = false) {
+  if (!tactics.length) return dash();
+  return el("span", { class: `tchain${compact ? " compact" : ""}` }, tactics.map((t) => el("span", { class: "tstep" }, t)));
+}
+
+const IncidentsPage = {
+  title: "Incidents",
+  status: "open", rows: [], sig: "",
+  mount(root) {
+    this.sig = "";
+    root.replaceChildren(
+      pageHead("Incidents", "Alerts correlated by device and time into cases, named by the attack pattern they match."),
+      el("div", { class: "tabs", role: "tablist", id: "in-tabs" }),
+      el("div", { class: "panel flush" },
+        el("div", { class: "table-wrap" },
+          el("table", { class: "table" },
+            el("thead", {}, el("tr", {},
+              el("th", { class: "w-sev" }, "Severity"), el("th", {}, "Incident"), el("th", {}, "Device"),
+              el("th", {}, "Attack progression"), el("th", { class: "num" }, "Alerts"),
+              el("th", { class: "w-time" }, "Last activity"), el("th", {}, "Status"))),
+            el("tbody", { id: "in-rows" })),
+          el("div", { id: "in-empty" }))),
+    );
+    this.renderTabs();
+  },
+  renderTabs() {
+    $("in-tabs").replaceChildren(...[["open", "Open"], ["closed", "Closed"], ["all", "All"]].map(([k, label]) =>
+      el("button", { type: "button", role: "tab", class: this.status === k ? "on" : "", "aria-selected": String(this.status === k),
+        onclick: () => { this.status = k; this.sig = ""; this.renderTabs(); this.refresh().catch((e) => toast(e.message, true)); } }, label)));
+  },
+  async refresh() {
+    await ensureHosts();
+    const rows = await api(`/api/incidents?status=${this.status}&days=30`);
+    const sig = JSON.stringify(rows);
+    if (sig === this.sig) return;
+    this.sig = sig;
+    this.rows = rows;
+    $("in-rows").replaceChildren(...rows.map((i) => el("tr", {
+      class: `clickable sevrow-${i.severity}`, tabindex: "0",
+      onclick: (e) => { if (!e.target.closest("a")) go("incidents", i.id); },
+      onkeydown: (e) => { if (e.key === "Enter") go("incidents", i.id); } },
+      el("td", {}, sevTag(i.severity), i.escalated ? el("span", { class: "esc", title: "Escalated: spans 3+ ATT&CK tactics" }, "▲") : null),
+      el("td", { class: "alert-cell" }, el("b", {}, i.title), el("small", { class: "mono" }, `${i.id} · ${i.techniques.join(", ") || "no technique"}`)),
+      el("td", { class: "nowrap" }, i.mac || i.ip ? deviceLink(i.mac, i.ip, i.name || undefined) : dash(),
+        i.trusted === false ? el("span", { class: "flag" }, "untrusted") : null),
+      el("td", {}, tacticChain(i.tactics, true)),
+      el("td", { class: "num" }, String(i.alert_count)),
+      el("td", { class: "mono nowrap muted", title: fullTime(i.last_ts) }, stamp(i.last_ts)),
+      el("td", { class: "nowrap" }, incStatusTag(i.status)))));
+    $("in-empty").replaceChildren(rows.length ? "" : empty(this.status === "open" ? "No open incidents." : "No incidents in the last 30 days."));
+  },
+};
+
+async function openIncidentDrawer(id) {
+  const [inc] = await Promise.all([api(`/api/incidents/${encodeURIComponent(id)}`), ensureHosts()]);
+  const noteBox = el("textarea", { rows: "2", placeholder: "Note for every alert in this incident (optional)", maxlength: "1000", "aria-label": "Incident note" });
+  const setStatus = (status) => act(() => api(`/api/incidents/${inc.id}/status`, { method: "POST", body: { status, note: noteBox.value } })
+    .then(reopenDrawer), `${inc.id} marked ${INCIDENT_STATUS[status].toLowerCase()}`);
+  const actions = inc.open
+    ? [inc.status === "new" ? el("button", { class: "btn", type: "button", onclick: () => setStatus("investigating") }, "Investigate") : null,
+       el("button", { class: "btn primary", type: "button", onclick: () => setStatus("resolved") }, "Resolve incident"),
+       el("button", { class: "btn", type: "button", onclick: () => setStatus("false_positive") }, "False positive")]
+    : [el("button", { class: "btn", type: "button", onclick: () => setStatus("investigating") }, "Reopen")];
+  const ioc = inc.indicators;
+  const iocText = [...ioc.macs.map((m) => `mac\t${m}`), ...ioc.ips.map((i) => `ipv4\t${i}`), ...ioc.ports.map((p) => `port\t${p}`)].join("\n");
+
+  // Merge the incident's alerts with the device's activity in the same window.
+  const timeline = [
+    ...inc.chain.map((c) => ({ ts: c.ts, node: () => el("li", {}, el("span", { class: `tl-dot sev-bg-${c.severity}` }),
+      el("time", { datetime: c.ts, title: fullTime(c.ts) }, stamp(c.ts)),
+      el("div", { class: "tl-body" }, el("span", { class: "tl-kind" }, c.stage || "Context"),
+        el("a", { href: `#/alerts/${c.alert_id}`, class: "link" }, c.title), el("span", { class: "muted" }, c.message))) })),
+    ...inc.events.map((e) => ({ ts: e.ts, node: () => el("li", {}, eventDot(e.kind),
+      el("time", { datetime: e.ts, title: fullTime(e.ts) }, stamp(e.ts)),
+      el("div", { class: "tl-body" }, el("span", { class: "tl-kind" }, EVENT_LABELS[e.kind] || e.kind), el("span", {}, e.message))) })),
+  ].sort((x, y) => x.ts.localeCompare(y.ts));
+
+  renderDrawer(
+    el("header", { class: "drawer-head" },
+      el("div", {},
+        el("div", { class: "eyebrow" }, sevTag(inc.severity), el("span", { class: "mono muted" }, inc.id), incStatusTag(inc.status),
+          inc.escalated ? el("span", { class: "flag" }, "escalated") : null),
+        el("h2", {}, inc.title)),
+      closeBtn()),
+    el("p", { class: "message" }, inc.narrative),
+    section("Attack chain", el("ol", { class: "chain" }, inc.chain.map((c) => el("li", { class: `chain-step sev-line-${c.severity}` },
+      el("span", { class: "chain-stage" }, c.stage || "Context"),
+      el("a", { href: `#/alerts/${c.alert_id}`, class: "chain-title" }, c.title),
+      el("span", { class: "chain-meta mono" }, `${stamp(c.ts)}${c.techniques.length ? "  ·  " + c.techniques.join(", ") : ""}`))))),
+    el("dl", { class: "kv" },
+      el("dt", {}, "Device"), el("dd", {}, inc.mac || inc.ip ? [deviceLink(inc.mac, inc.ip, inc.name || undefined),
+        el("span", { class: "mono muted" }, `  ${inc.ip}  ${inc.mac}`)] : "—"),
+      el("dt", {}, "Window"), el("dd", { class: "mono" }, `${stamp(inc.first_ts)} → ${stamp(inc.last_ts)}`),
+      el("dt", {}, "Alerts"), el("dd", {}, `${inc.alert_count} (${inc.open_alerts} open)`),
+      el("dt", {}, "ATT&CK"), el("dd", { class: "mitre" }, inc.technique_details.map((t) =>
+        el("a", { class: "link", href: t.url, target: "_blank", rel: "noopener noreferrer" },
+          el("span", { class: "mono" }, t.id), ` ${t.name}`, icon("external", 12))))),
+    noteBox,
+    el("div", { class: "btn-row" }, actions,
+      el("button", { class: "btn quiet", type: "button", onclick: () => download(`/api/incidents/${inc.id}/report.md`) }, icon("download", 14), "Incident report")),
+    section("Recommended response", el("ol", { class: "steps" }, inc.response.map((t) => el("li", {}, richText(t))))),
+    section("Indicators",
+      el("table", { class: "table compact" }, el("tbody", {},
+        ioc.macs.map((m) => el("tr", {}, el("td", { class: "muted" }, "MAC"), el("td", { class: "mono" }, m))),
+        ioc.ips.map((i) => el("tr", {}, el("td", { class: "muted" }, "IPv4"), el("td", { class: "mono" }, i))),
+        ioc.ports.map((p) => el("tr", {}, el("td", { class: "muted" }, "Port"), el("td", { class: "mono" }, p))),
+        ioc.impersonated.map((i) => el("tr", {}, el("td", { class: "muted" }, "Impersonated"), el("td", { class: "mono" }, `${i} (victim)`))))),
+      iocText ? el("div", {}, el("button", { class: "btn", type: "button", onclick: () =>
+        navigator.clipboard.writeText(iocText).then(() => toast("Indicators copied"), () => toast("Clipboard blocked", true)) }, "Copy indicators")) : null),
+    section("Timeline", el("ol", { class: "timeline" }, timeline.map((t) => t.node()))),
+  );
+}
 
 // ============================================================================
 // Page: Alerts (triage queue)
@@ -811,6 +952,121 @@ const ActivityPage = {
 };
 
 // ============================================================================
+// Page: Detections (detection engineering: coverage, fidelity, validation)
+// ============================================================================
+// "test_detect.py::test_x" -> unit test; anything else names a simulation scenario.
+function validatedBy(ref, results) {
+  if (!ref) return dash();
+  const [file, test] = ref.split("::");
+  if (test) return el("span", { title: ref }, el("small", { class: "muted" }, "unit test"), el("span", { class: "mono" }, test.replace(/^test_/, "")));
+  const r = results[ref];
+  return el("span", { title: `netguard validate: ${ref}` },
+    el("small", { class: r ? (r.passed ? "ok" : "bad") : "muted" }, r ? (r.passed ? "simulation ✓" : "simulation ✗") : "simulation"),
+    el("span", { class: "mono" }, ref));
+}
+
+const DetectionsPage = {
+  title: "Detections",
+  sig: "", validation: null,
+  mount(root) {
+    this.sig = "";
+    root.replaceChildren(
+      pageHead("Detections", "Coverage, response times and rule quality over the last 30 days.",
+        el("button", { class: "btn", type: "button", onclick: () => download("/api/export/alerts.ecs.ndjson?status=all&days=30") }, icon("download", 14), "ECS export")),
+      el("section", { class: "stats", id: "de-stats" }),
+      panel("ATT&CK coverage", "Techniques this sensor can observe, by tactic", el("div", { id: "de-matrix" })),
+      el("div", { class: "panel flush" },
+        el("header", { class: "panel-head" }, el("h2", {}, "Rule fidelity"), el("div", { class: "panel-meta" }, "True-positive rate = resolved ÷ (resolved + false positive)")),
+        el("div", { class: "table-wrap" },
+          el("table", { class: "table" },
+            el("thead", {}, el("tr", {}, ["Rule", "Technique", "Data source", "Alerts", "Open", "Resolved", "False pos.", "Suppressed", "TP rate", "Time to resolve", "Validated by"]
+              .map((t, i) => el("th", { class: i >= 3 && i <= 9 ? "num" : "" }, t)))),
+            el("tbody", { id: "de-rules" })))),
+      el("div", { class: "panel" },
+        el("header", { class: "panel-head" }, el("h2", {}, "Attack simulation"),
+          el("button", { class: "btn", type: "button", id: "de-run", onclick: () => this.runValidation() }, "Run validation")),
+        el("div", { class: "panel-body", id: "de-sims" })),
+    );
+  },
+  async runValidation() {
+    const btn = $("de-run");
+    btn.disabled = true;
+    try {
+      this.validation = await api("/api/validation");
+      const ok = this.validation.filter((v) => v.passed).length;
+      toast(`${ok}/${this.validation.length} scenarios passed`, ok !== this.validation.length);
+      this.sig = "";
+      await this.refresh();
+    } catch (err) { toast(err.message, true); }
+    btn.disabled = false;
+  },
+  async refresh() {
+    // Replaying the simulations takes milliseconds, so show live results by default.
+    if (!this.validation) this.validation = await api("/api/validation").catch(() => null);
+    const [det, m] = await Promise.all([api("/api/detections?days=30"), api("/api/metrics?days=30")]);
+    const sig = JSON.stringify([det, m, this.validation]);
+    if (sig === this.sig) return;
+    this.sig = sig;
+    const results = Object.fromEntries((this.validation || []).map((v) => [v.name, v]));
+
+    const c = m.correlation;
+    $("de-stats").replaceChildren(
+      stat("Time to triage", dur(m.mtta.median), m.mtta.n ? `median · mean ${dur(m.mtta.mean)}` : "no data"),
+      stat("Time to resolve", dur(m.mttr.median), m.mttr.n ? `median · mean ${dur(m.mttr.mean)}` : "no data"),
+      stat("False-positive rate", pct(m.false_positive_rate), `of ${m.closed} closed alerts`),
+      stat("Alert → incident", c.incidents ? `${c.alerts_in_incidents} → ${c.incidents}` : "—", c.incidents ? `${c.ratio} alerts per case` : "no incidents"),
+      stat("Open alerts", m.open, m.oldest_open ? `oldest ${ago(m.oldest_open)}` : "queue empty", { alarm: m.open > 0 }),
+      stat("Suppressed", m.suppressed, "recorded, not notified"),
+    );
+
+    // Coverage matrix: covered tactics as columns; uncovered ones named, not hidden.
+    const hits = Object.fromEntries(det.rules.map((r) => [r.kind, r.alerts]));
+    const covered = new Set(det.coverage.map((col) => col.tactic));
+    $("de-matrix").replaceChildren(
+      el("div", { class: "matrix" }, det.coverage.map((col) => el("div", { class: "mx-col" },
+        el("h3", {}, col.tactic),
+        col.techniques.map((t) => {
+          const n = t.rules.reduce((s, k) => s + (hits[k] || 0), 0);
+          return el("a", { class: `mx-cell${n ? " hot" : ""}`, href: t.url, target: "_blank", rel: "noopener noreferrer" },
+            el("span", { class: "mono" }, t.id), el("b", {}, t.name.replace(/^Adversary-in-the-Middle: /, "AiTM: ")),
+            el("small", {}, `${t.rules.length} rule${t.rules.length === 1 ? "" : "s"} · ${n} alert${n === 1 ? "" : "s"}`));
+        })))),
+      el("p", { class: "muted gap-note" }, "Outside a network sensor's view: ",
+        det.tactics.filter((t) => !covered.has(t)).join(", "), ". Pair with endpoint telemetry (EDR, Sysmon) for those."));
+
+    $("de-rules").replaceChildren(...det.rules.map((r) => el("tr", {},
+      el("td", { class: "alert-cell" }, el("b", {}, r.title), el("small", { class: "mono" }, r.kind)),
+      el("td", { class: "mono nowrap" }, r.techniques.length ? r.techniques.map((t) => el("span", { class: "tid" }, t)) : dash()),
+      el("td", { class: "nowrap muted" }, r.source),
+      el("td", { class: "num" }, String(r.alerts)),
+      el("td", { class: "num" }, r.open ? el("span", { class: "alert-n" }, String(r.open)) : "0"),
+      el("td", { class: "num" }, String(r.resolved)),
+      el("td", { class: "num" }, String(r.false_positive)),
+      el("td", { class: "num" }, String(r.suppressed)),
+      el("td", { class: "num" }, r.tp_rate === null ? dash() : el("span", { class: `rate${r.tp_rate < 0.5 ? " low" : ""}`,
+        title: r.tp_rate < 0.5 ? "Tuning candidate" : "" }, pct(r.tp_rate))),
+      el("td", { class: "num mono" }, dur(r.median_ttr)),
+      el("td", { class: "validated" }, validatedBy(r.validated_by, results)))));
+
+    $("de-sims").replaceChildren(
+      el("p", { class: "muted" }, "Synthetic captures of each attack (and of normal traffic) replayed through the live detectors. ",
+        "Same as ", el("code", {}, "netguard validate"), "; the .pcap files are in ", el("code", {}, "samples/"), "."),
+      el("ul", { class: "sims" }, det.scenarios.map((s) => {
+        const r = results[s.name];
+        const want = s.expect.filter((k) => k !== "dhcp_server_learned");
+        return el("li", {},
+          r ? el("span", { class: `verdict ${r.passed ? "pass" : "fail"}` }, r.passed ? "PASS" : "FAIL") : el("span", { class: "verdict" }, "—"),
+          el("div", {},
+            el("b", {}, s.title), s.technique ? el("span", { class: "mono muted" }, `  ${s.technique}`) : null,
+            s.gap ? el("span", { class: "flag" }, "known gap") : null,
+            el("small", {}, s.description),
+            el("small", { class: "mono" }, want.length ? `expects: ${want.join(", ")}` : s.forbid.includes("*") ? "expects: no alerts" : `must not fire: ${s.forbid.join(", ")}`,
+              r ? `  ·  ${r.packets} packets, fired: ${r.fired.filter((k) => k !== "dhcp_server_learned").join(", ") || "nothing"}` : "")));
+      })));
+  },
+};
+
+// ============================================================================
 // Page: Rules (suppressions)
 // ============================================================================
 const RulesPage = {
@@ -918,6 +1174,9 @@ async function openAlertDrawer(id) {
         el("h2", {}, pb.title)),
       closeBtn()),
     el("p", { class: "message" }, a.message),
+    a.incident ? el("a", { class: "incident-link", href: `#/incidents/${a.incident.id}` },
+      sevTag(a.incident.severity), el("span", {}, el("b", {}, `Part of ${a.incident.id}`), ` ${a.incident.title}`),
+      el("span", { class: "muted" }, `${a.incident.alert_count} alerts`)) : null,
     el("dl", { class: "kv" },
       el("dt", {}, "Device"), el("dd", {}, a.host ? [deviceLink(a.host.mac, a.host.ip, a.host.name || a.host.ip),
         el("span", { class: "mono muted" }, `  ${a.host.ip}`), a.host.trusted ? "" : el("span", { class: "flag" }, "untrusted")] : (a.ip || a.mac || "—")),
@@ -946,6 +1205,10 @@ async function openAlertDrawer(id) {
         el("a", { href: `#/alerts/${r.id}`, class: "row-link" }, sevTag(r.severity),
           el("span", { class: "row-main" }, el("b", {}, pbTitle(r.kind)), el("small", {}, r.message)),
           statusTag(r.status)))))) : null,
+    a.history?.length ? section("Audit trail", el("ol", { class: "audit" }, a.history.map((h) => el("li", {},
+      el("time", { class: "mono muted", title: fullTime(h.ts) }, stamp(h.ts)),
+      h.from_status ? el("span", {}, statusTag(h.from_status), " → ", statusTag(h.to_status)) : el("span", {}, "Raised as ", statusTag(h.to_status)),
+      el("span", { class: "muted" }, h.from_status ? `+${dur((Date.parse(h.ts) - Date.parse(a.ts)) / 1000)}` : ""))))) : null,
     section("Raw event", el("pre", { class: "json" }, JSON.stringify(a.details, null, 2))),
   );
 }
@@ -1050,8 +1313,7 @@ async function reopenDrawer() {
   const { type, id } = state.drawer;
   const scroll = $("drawer-body").scrollTop;
   try {
-    if (type === "alert") await openAlertDrawer(id);
-    else await openDeviceDrawer(id);
+    await DRAWERS[type](id);
     $("drawer-body").scrollTop = scroll;
   } catch (err) {
     toast(err.message, true);
@@ -1062,7 +1324,11 @@ async function reopenDrawer() {
 // ============================================================================
 // Router & refresh loop
 // ============================================================================
-const PAGES = { overview: OverviewPage, alerts: AlertsPage, devices: DevicesPage, activity: ActivityPage, rules: RulesPage };
+const PAGES = { overview: OverviewPage, incidents: IncidentsPage, alerts: AlertsPage, devices: DevicesPage,
+  activity: ActivityPage, detections: DetectionsPage, rules: RulesPage };
+// Pages whose URL argument opens a drawer: #/alerts/12, #/devices/aa:bb..., #/incidents/INC-0001
+const DRAWER_FOR = { alerts: "alert", devices: "device", incidents: "incident" };
+const DRAWERS = { alert: openAlertDrawer, device: openDeviceDrawer, incident: openIncidentDrawer };
 
 function go(page, arg = "") {
   location.hash = `#/${page}${arg ? "/" + encodeURIComponent(arg) : ""}`;
@@ -1088,12 +1354,11 @@ async function route() {
 
   state.arg = arg;
   if (!arg) { hideDrawer(); return; }
-  const type = pageName === "alerts" ? "alert" : pageName === "devices" ? "device" : null;
+  const type = DRAWER_FOR[pageName];
   if (!type) return;
   state.drawer = { type, id: arg };
   try {
-    if (type === "alert") await openAlertDrawer(arg);
-    else await openDeviceDrawer(arg);
+    await DRAWERS[type](arg);
   } catch (err) {
     toast(err.message, true);
     closeDrawer();
@@ -1102,6 +1367,7 @@ async function route() {
 
 async function refresh() {
   clearTimeout(state.timer);
+  if (state.stopped) return;
   try {
     state.status = await api("/api/status");
     renderStatus();
@@ -1120,6 +1386,30 @@ async function refresh() {
 // Wiring
 // ============================================================================
 $("scan-btn").addEventListener("click", () => act(() => api("/api/scan", { method: "POST" }), "Scan started"));
+$("stop-btn").addEventListener("click", async () => {
+  const monitoring = state.status?.monitoring;
+  if (!confirm(monitoring
+    ? "Stop NetGuard? Monitoring of your network stops until you start it again."
+    : "Stop NetGuard? This shuts down the dashboard server.")) return;
+  try {
+    await api("/api/shutdown", { method: "POST" });
+  } catch (err) {
+    toast(`Couldn't stop: ${err.message}`, true);
+    return;
+  }
+  state.stopped = true;
+  clearTimeout(state.timer);
+  hideDrawer();
+  document.querySelector(".topbar").hidden = true;
+  $("foot").hidden = true;
+  $("banner").hidden = true;
+  $("page").replaceChildren(el("section", { class: "stopped" },
+    el("h1", {}, "NetGuard stopped"),
+    el("p", { class: "muted" }, "The server has shut down. You can close this tab."),
+    el("p", {}, "To start it again: ", el("code", {}, "python -m netguard serve --open"),
+      " or double-click ", el("code", {}, "NetGuard.bat"), ".")));
+  document.title = "Stopped · NetGuard";
+});
 $("scrim").addEventListener("click", closeDrawer);
 document.addEventListener("keydown", (e) => { if (e.key === "Escape" && state.drawer) closeDrawer(); });
 window.addEventListener("hashchange", route);
@@ -1128,7 +1418,7 @@ window.addEventListener("resize", () => {
   clearTimeout(resizeTimer);
   resizeTimer = setTimeout(() => { if (state.page) { state.page.sig = ""; refresh(); } }, 200);
 });
-setInterval(renderStatus, 1000);  // keeps the countdown ticking between polls
+setInterval(() => { if (!state.stopped) renderStatus(); }, 1000);  // keeps the countdown ticking
 
 (async () => {
   try { state.playbooks = await api("/api/playbooks"); } catch { /* shown by refresh() */ }

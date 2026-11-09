@@ -86,6 +86,18 @@ CREATE TABLE IF NOT EXISTS suppressions (
     last_hit TEXT NOT NULL DEFAULT ''
 );
 
+-- Audit trail: every triage transition, so response times (MTTA/MTTR)
+-- can be measured and every closed alert shows who-did-what-when.
+CREATE TABLE IF NOT EXISTS alert_history (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    alert_id    INTEGER NOT NULL,
+    ts          TEXT NOT NULL,
+    from_status TEXT NOT NULL DEFAULT '',
+    to_status   TEXT NOT NULL,
+    note        TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS alert_history_alert ON alert_history (alert_id);
+
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -313,7 +325,32 @@ class Store:
         )
         alert.id = cur.lastrowid
         alert.updated_at = alert.ts
+        self._log_transition(alert.id, alert.ts, "", alert.status)
         self.conn.commit()
+
+    def _log_transition(self, alert_id: int, ts: str, old: str, new: str, note: str = "") -> None:
+        self.conn.execute(
+            "INSERT INTO alert_history (alert_id, ts, from_status, to_status, note)"
+            " VALUES (?, ?, ?, ?, ?)", (alert_id, ts, old, new, note[:300]))
+
+    def alert_history(self, alert_id: int) -> list[dict]:
+        """Status transitions for one alert, oldest first."""
+        return [dict(r) for r in self.conn.execute(
+            "SELECT ts, from_status, to_status, note FROM alert_history"
+            " WHERE alert_id = ? ORDER BY id", (alert_id,))]
+
+    def all_history(self, since: str | None = None) -> dict[int, list[dict]]:
+        """{alert_id: [transitions]} for alerts raised since `since`."""
+        sql = ("SELECT h.alert_id, h.ts, h.from_status, h.to_status FROM alert_history h"
+               " JOIN alerts a ON a.id = h.alert_id")
+        params: list = []
+        if since:
+            sql += " WHERE a.ts >= ?"
+            params.append(since)
+        out: dict[int, list[dict]] = {}
+        for r in self.conn.execute(sql + " ORDER BY h.id", params):
+            out.setdefault(r["alert_id"], []).append(dict(r))
+        return out
 
     def get_alert(self, alert_id: int) -> Alert | None:
         row = self.conn.execute("SELECT * FROM alerts WHERE id = ?", (alert_id,)).fetchone()
@@ -371,28 +408,39 @@ class Store:
             counts[r["status"]] = r["n"]
         return counts
 
-    def set_alert_status(self, alert_id: int, status: str, note: str = "") -> bool:
-        """Move an alert through the triage workflow, optionally with a note."""
+    def set_alert_status(self, alert_id: int, status: str, note: str = "",
+                         ts: str | None = None) -> bool:
+        """Move an alert through the triage workflow, optionally with a note.
+
+        Every real transition is written to the audit trail. `ts` exists for
+        imports and the demo; normal callers let it default to now.
+        """
         if status not in ALERT_STATUSES:
             raise ValueError(f"Unknown status {status!r}")
-        ts = now_iso()
-        cur = self.conn.execute(
+        ts = ts or now_iso()
+        row = self.conn.execute("SELECT status FROM alerts WHERE id = ?", (alert_id,)).fetchone()
+        if row is None:
+            return False
+        self.conn.execute(
             "UPDATE alerts SET status = ?, acked = ?, updated_at = ? WHERE id = ?",
             (status, int(status not in OPEN_STATUSES), ts, alert_id))
+        if row["status"] != status:
+            self._log_transition(alert_id, ts, row["status"], status, " ".join(note.split()))
         self.conn.commit()
-        if cur.rowcount and note.strip():
-            self.add_alert_note(alert_id, note)
-        return cur.rowcount > 0
+        if note.strip():
+            self.add_alert_note(alert_id, note, ts=ts)
+        return True
 
-    def set_status_bulk(self, ids: list[int], status: str) -> int:
-        return sum(self.set_alert_status(i, status) for i in ids)
+    def set_status_bulk(self, ids: list[int], status: str, note: str = "") -> int:
+        return sum(self.set_alert_status(i, status, note) for i in ids)
 
-    def add_alert_note(self, alert_id: int, note: str) -> bool:
+    def add_alert_note(self, alert_id: int, note: str, ts: str | None = None) -> bool:
         """Append a timestamped line to the alert's investigation notes."""
-        line = f"[{now_iso()}] {' '.join(note.split())[:1000]}"
+        ts = ts or now_iso()
+        line = f"[{ts}] {' '.join(note.split())[:1000]}"
         cur = self.conn.execute(
             "UPDATE alerts SET notes = CASE WHEN notes = '' THEN ? ELSE notes || char(10) || ? END,"
-            " updated_at = ? WHERE id = ?", (line, line, now_iso(), alert_id))
+            " updated_at = ? WHERE id = ?", (line, line, ts, alert_id))
         self.conn.commit()
         return cur.rowcount > 0
 
@@ -400,11 +448,9 @@ class Store:
         return self.set_alert_status(alert_id, "resolved")
 
     def ack_all(self) -> int:
-        cur = self.conn.execute(
-            "UPDATE alerts SET status = 'resolved', acked = 1, updated_at = ? "
-            "WHERE status IN ('new', 'investigating')", (now_iso(),))
-        self.conn.commit()
-        return cur.rowcount
+        ids = [r["id"] for r in self.conn.execute(
+            "SELECT id FROM alerts WHERE status IN ('new', 'investigating')")]
+        return self.set_status_bulk(ids, "resolved")
 
     # -- statistics ----------------------------------------------------------
     def alert_series(self, days: int = 14) -> list[dict]:
@@ -478,6 +524,7 @@ class Store:
         self.conn.execute("DELETE FROM events WHERE ts < ?", (cutoff,))
         self.conn.execute("DELETE FROM alerts WHERE ts < ? AND status NOT IN ('new', 'investigating')",
                           (cutoff,))
+        self.conn.execute("DELETE FROM alert_history WHERE alert_id NOT IN (SELECT id FROM alerts)")
         self.conn.commit()
 
     # -- suppression rules ---------------------------------------------------

@@ -10,7 +10,10 @@ Everything else works with the standard library alone, so scapy is imported
 lazily and its absence just disables these features.
 
 Packet parsing is split from the detectors (in detect.py) so the detection
-logic is testable with plain function calls.
+logic is testable with plain function calls. scapy packets are converted to
+the same small event types the offline pcap analyzer produces (pcap.py),
+and both go through one `dispatch()`, so live and offline detection behave
+identically.
 """
 
 # --- Imports ----------------------------------------------------------------
@@ -19,26 +22,16 @@ from __future__ import annotations
 import logging
 import random
 import threading
-from dataclasses import dataclass
 from typing import Callable
 
-from .detect import ArpWatcher, DhcpWatcher, PortScanDetector
 from .models import Alert
+from .pcap import (DHCP_ACK, DHCP_OFFER, TCP_ACK, TCP_SYN, ArpClaim, DhcpReply,
+                   TcpSyn, Watchers, dispatch)
 
 logger = logging.getLogger(__name__)
 
-SYN, ACK = 0x02, 0x10
-DHCP_OFFER, DHCP_ACK = 2, 5
 BPF_FILTER = "tcp or arp or (udp and (port 67 or port 68))"
-
-
-@dataclass
-class Watchers:
-    """Which detectors the sniffer should feed. Any can be None."""
-
-    port_scan: PortScanDetector | None = None
-    arp: ArpWatcher | None = None
-    dhcp: DhcpWatcher | None = None
+__all__ = ["Watchers", "make_handler", "start_sniffer", "probe_dhcp_servers", "scapy_available"]
 
 
 # --- Functions --------------------------------------------------------------
@@ -61,29 +54,27 @@ def make_handler(watchers: Watchers, on_alert: Callable[[Alert], None],
                  local_ips: set[str]) -> Callable:
     from scapy.all import ARP, BOOTP, DHCP, IP, TCP, Ether
 
-    def handle(pkt) -> None:
-        ts = float(pkt.time)
-        alert = None
-
-        if watchers.arp and ARP in pkt:
+    def to_event(pkt):
+        if ARP in pkt:
             # Both requests and replies assert "psrc is at hwsrc".
-            a = pkt[ARP]
-            alert = watchers.arp.feed(a.psrc, a.hwsrc.lower(), ts)
-
-        elif watchers.dhcp and DHCP in pkt:
+            return ArpClaim(pkt[ARP].psrc, pkt[ARP].hwsrc.lower())
+        if DHCP in pkt:
             opts = dhcp_options(pkt)
             if opts.get("message-type") in (DHCP_OFFER, DHCP_ACK):
                 server = opts.get("server_id") or pkt[IP].src
                 mac = pkt[Ether].src.lower() if Ether in pkt else ""
-                alert = watchers.dhcp.feed(str(server), mac, pkt[BOOTP].yiaddr, ts)
-
-        elif watchers.port_scan and IP in pkt and TCP in pkt:
+                return DhcpReply(str(server), mac, pkt[BOOTP].yiaddr)
+            return None
+        if IP in pkt and TCP in pkt:
             flags = int(pkt[TCP].flags)
             # Initial SYN only (no ACK): one per connection attempt.
-            if flags & SYN and not flags & ACK:
-                if not local_ips or pkt[IP].dst in local_ips:
-                    alert = watchers.port_scan.feed(pkt[IP].src, int(pkt[TCP].dport), ts)
+            if flags & TCP_SYN and not flags & TCP_ACK:
+                return TcpSyn(pkt[IP].src, pkt[IP].dst, int(pkt[TCP].dport))
+        return None
 
+    def handle(pkt) -> None:
+        event = to_event(pkt)
+        alert = dispatch(event, float(pkt.time), watchers, local_ips) if event else None
         if alert:
             on_alert(alert)
 
