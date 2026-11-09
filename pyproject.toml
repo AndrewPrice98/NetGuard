@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "netguard"
+version = "0.3.0"
+description = "A lightweight LAN intrusion detection system with a web dashboard"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []  # standard library only
+
+[project.optional-dependencies]
+sniff = ["scapy>=2.5"]
+dev = ["pytest>=7"]
+
+[project.scripts]
+netguard = "netguard.cli:main"
+
+[tool.setuptools]
+packages = ["netguard", "netguard.web"]
+
+[tool.setuptools.package-data]
+"netguard.web" = ["static/*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

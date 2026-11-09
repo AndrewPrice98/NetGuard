@@ -1,0 +1,29 @@
+# systemd unit: run NetGuard at boot on a Linux box / Raspberry Pi.
+#
+#   sudo useradd --system --home /var/lib/netguard --create-home netguard
+#   sudo pip install "netguard[sniff] @ /path/to/repo"
+#   sudo cp deploy/netguard.service /etc/systemd/system/
+#   sudo systemctl enable --now netguard
+#   journalctl -u netguard -f
+[Unit]
+Description=NetGuard LAN intrusion detection
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=netguard
+WorkingDirectory=/var/lib/netguard
+ExecStart=/usr/local/bin/netguard serve --sniff
+Restart=on-failure
+RestartSec=10
+# Raw-socket capture without running as root.
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/netguard
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

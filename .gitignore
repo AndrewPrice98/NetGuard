@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+.pytest_cache/
+
+# Runtime data: contains your network's devices and alert history.
+*.db
+*.db-wal
+*.db-shm
+netguard.toml
+alerts.jsonl
+netguard.log
+netguard-report.html
+inventory.csv

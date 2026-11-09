@@ -1,0 +1,57 @@
+# NetGuard configuration. Copy to netguard.toml and edit; every setting is
+# optional. Command-line flags override this file.
+
+[scan]
+subnet = ""            # blank = the /24 around your default gateway
+interval = 300         # seconds between scans for `watch` and `serve`
+ports = true           # TCP-check common ports on each device
+workers = 128          # concurrent ARP lookups (threads, not processes)
+
+[sniff]
+# Live detection. Needs `pip install scapy`, admin/root, and Npcap on Windows.
+enabled = false
+iface = ""             # blank = scapy's default interface
+port_scan = true       # someone sweeping ports on this machine
+arp = true             # ARP spoofing the moment it happens
+dhcp = true            # rogue DHCP servers
+port_scan_threshold = 15
+port_scan_window = 10  # seconds
+dhcp_servers = []      # e.g. ["192.168.1.1"]; empty = trust the first one seen
+
+[web]
+host = "127.0.0.1"     # keep it local unless you set a token
+port = 8000
+token = ""             # required for API access when set; needed for non-localhost
+
+[alerts]
+suppress_minutes = 60  # don't repeat an identical alert within this window
+log = ""               # e.g. "alerts.jsonl" for a SIEM / jq
+
+# --- Notifications (add as many as you like) -------------------------------
+
+[[notify]]
+type = "desktop"
+min_severity = "HIGH"
+
+# [[notify]]
+# type = "webhook"
+# format = "discord"       # discord | slack | ntfy | json
+# url = "https://discord.com/api/webhooks/..."
+# min_severity = "MEDIUM"
+
+# [[notify]]
+# type = "webhook"
+# format = "ntfy"          # free push notifications to your phone: https://ntfy.sh
+# url = "https://ntfy.sh/pick-a-long-random-topic-name"
+# min_severity = "HIGH"
+
+# [[notify]]
+# type = "email"
+# host = "smtp.gmail.com"
+# port = 587
+# starttls = true
+# username = "you@gmail.com"
+# password_env = "NETGUARD_SMTP_PASSWORD"   # app password, read from this env var
+# from = "you@gmail.com"
+# to = ["you@gmail.com"]
+# min_severity = "HIGH"
